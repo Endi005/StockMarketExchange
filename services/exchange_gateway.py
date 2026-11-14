@@ -1,7 +1,11 @@
 
 import json
 import socket
+import secrets
+import time
 from pathlib import Path
+
+from services.server_auth import sign_message, verify_message
 
 
 class ExchangeGateway:
@@ -23,13 +27,22 @@ class ExchangeGateway:
             encoding="utf-8"
         ).strip()
 
+        nonce = secrets.token_urlsafe(24)
+
         request = {
-            "key": server_key,
-            "action": action
+            "action": action,
+            "nonce": nonce,
+            "timestamp": time.time()
         }
 
         if symbol is not None:
             request["symbol"] = symbol
+
+        request["signature"] = sign_message(
+            request,
+            server_key,
+            "broker-request"
+        )
 
         try:
             with socket.create_connection(
@@ -62,6 +75,20 @@ class ExchangeGateway:
 
         if not isinstance(response, dict):
             raise RuntimeError("Invalid exchange response format.")
+
+        if not verify_message(
+            response,
+            server_key,
+            "exchange-response"
+        ):
+            raise RuntimeError(
+                "Exchange response authentication failed."
+            )
+
+        if response.get("nonce") != nonce:
+            raise RuntimeError(
+                "Exchange response nonce mismatch."
+            )
 
         if response.get("ok") is not True:
             raise RuntimeError(

@@ -9,6 +9,8 @@ from pathlib import Path
 from models.stock import Stock
 from services.exchange_service import ExchangeService
 from repositories.exchange_repository import ExchangeRepository
+from services.server_auth import sign_message, verify_message
+from services.replay_guard import ReplayGuard
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -33,6 +35,7 @@ class ExchangeHandler(socketserver.StreamRequestHandler):
 
     def handle(self):
         self.request.settimeout(5)
+        request = {}
 
         try:
             raw = self.rfile.readline(8192)
@@ -47,14 +50,19 @@ class ExchangeHandler(socketserver.StreamRequestHandler):
             if not isinstance(request, dict):
                 raise ValueError("Request must be a JSON object.")
 
-            key = request.get("key")
+            if not verify_message(
+                request,
+                self.server.server_key,
+                "broker-request"
+            ):
+                raise ValueError("Invalid server signature.")
 
-            if not isinstance(key, str) or not hmac.compare_digest(
-                key, self.server.server_key
+            if not self.server.replay_guard.accept(
+                request.get("nonce"),
+                request.get("timestamp")
             ):
                 raise ValueError(
-                    "Authentication refused. "
-                    "Use the correct server credential."
+                    "Duplicate or expired server request."
                 )
 
             action = request.get("action")
@@ -99,6 +107,18 @@ class ExchangeHandler(socketserver.StreamRequestHandler):
                 "error": "Internal server error."
             }
 
+        response["nonce"] = (
+            request.get("nonce")
+            if isinstance(request, dict)
+            else None
+        )
+
+        response["signature"] = sign_message(
+            response,
+            self.server.server_key,
+            "exchange-response"
+        )
+
         try:
             self.wfile.write(
                 (json.dumps(response) + "\n").encode("utf-8")
@@ -114,6 +134,7 @@ class ExchangeServer(socketserver.ThreadingTCPServer):
     def __init__(self, address, exchange, server_key):
         self.exchange = exchange
         self.server_key = server_key
+        self.replay_guard = ReplayGuard(ttl_seconds=300)
         super().__init__(address, ExchangeHandler)
 
 
