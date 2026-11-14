@@ -1,0 +1,23 @@
+﻿# Sensitive application data
+data/
+.env
+*.key
+
+# Python temporary files
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+
+# Editor settings
+.vscode/
+
+# Test and build files
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
