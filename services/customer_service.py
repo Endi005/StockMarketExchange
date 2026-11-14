@@ -3,6 +3,7 @@ import secrets
 import threading
 
 from models.customer import CustomerAccount
+from services.trade_commands import BuyStockCommand, SellStockCommand
 
 
 class CustomerService:
@@ -89,16 +90,18 @@ class CustomerService:
                 original.to_record()
             )
 
-            if action == "buy":
-                result = updated_customer.portfolio.buy(
-                    symbol, quantity, price
-                )
-            elif action == "sell":
-                result = updated_customer.portfolio.sell(
-                    symbol, quantity, price
-                )
-            else:
+            command_types = {
+                "buy": BuyStockCommand,
+                "sell": SellStockCommand
+            }
+
+            command_type = command_types.get(action)
+
+            if command_type is None:
                 raise ValueError("Invalid trading action.")
+
+            command = command_type(symbol, quantity, price)
+            result = command.execute(updated_customer.portfolio)
 
             updated_customers = self._customers.copy()
             updated_customers[username] = updated_customer
