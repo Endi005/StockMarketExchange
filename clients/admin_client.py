@@ -109,6 +109,21 @@ class AdminClient:
         )
         print(f"Total shares owned: {result['total_shares']}")
 
+    def show_exchange_statistics(self):
+        result = self.send_request(
+            "admin_exchange_statistics"
+        )
+
+        print("\n=== EXCHANGE SERVER STATISTICS ===")
+        print(f"Available stocks: {result['stock_count']}")
+
+        print("\nCurrent stock prices:")
+        for symbol, price_cents in result["prices"].items():
+            print(f"  {symbol}: ${price_cents / 100:.2f}")
+
+        print("\nRecorded price history:")
+        for symbol, count in result["history_entries"].items():
+            print(f"  {symbol}: {count} entries")
 
     def logout(self):
         self.send_request("admin_logout")
@@ -140,14 +155,15 @@ class AdminClient:
                         print("Choose 1, 2, or 3.")
 
                 else:
+                    print("\n=== ADMIN MENU ===")
                     print("1. View Broker Server status")
                     print("2. View customer statistics")
-                    print("3. Logout")
-                    print("4. Exit")
+                    print("3. View Exchange Server statistics")
+                    print("4. Logout")
+                    print("5. Exit")
 
                     choice = input("Choose option: ").strip()
 
-                    
                     if choice == "1":
                         self.show_status()
 
@@ -155,14 +171,17 @@ class AdminClient:
                         self.show_statistics()
 
                     elif choice == "3":
-                        self.logout()
+                        self.show_exchange_statistics()
 
                     elif choice == "4":
+                        self.logout()
+
+                    elif choice == "5":
                         print("Goodbye!")
                         break
 
                     else:
-                        print("Choose 1, 2, 3, or 4.")
+                        print("Choose 1, 2, 3, 4, or 5.")
 
             except (RuntimeError, ValueError, KeyError) as error:
                 print(f"Error: {error}")

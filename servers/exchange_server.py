@@ -73,6 +73,9 @@ class ExchangeHandler(socketserver.StreamRequestHandler):
                     request.get("symbol")
                 )
 
+            elif action == "get_statistics":
+                result = exchange.get_statistics()
+
             else:
                 raise ValueError(
                     "Unknown action. Use get_prices, "

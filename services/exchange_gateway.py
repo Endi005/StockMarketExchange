@@ -79,3 +79,6 @@ class ExchangeGateway:
     def get_history(self, symbol):
         return self.send_request("get_history", symbol)
 
+    def get_statistics(self):
+        return self.send_request("get_statistics")
+

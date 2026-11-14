@@ -79,7 +79,8 @@ class BrokerHandler(socketserver.StreamRequestHandler):
         if action in (
             "admin_status",
             "admin_logout",
-            "admin_statistics"
+            "admin_statistics",
+            "admin_exchange_statistics"
         ):
             admin_token = request.get("admin_token")
             admin_auth.require_admin(admin_token)
@@ -89,6 +90,9 @@ class BrokerHandler(socketserver.StreamRequestHandler):
 
             if action == "admin_statistics":
                 return customer_service.get_statistics()
+
+            if action == "admin_exchange_statistics":
+                return self.server.gateway.get_statistics()
 
             return {
                 "server": "Broker Server",
