@@ -5,10 +5,13 @@ import socketserver
 from pathlib import Path
 
 from services.exchange_gateway import ExchangeGateway
-from services.customer_service import CustomerService
 from services.admin_otp_service import AdminOTPService
 from services.admin_auth_service import AdminAuthService
-from repositories.customer_repository import CustomerRepository
+
+from repositories.trading_repository import TradingRepository
+from services.order_processor import OrderProcessor
+from services.order_queue import OrderQueue
+from services.queued_customer_service import QueuedCustomerService
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -34,10 +37,16 @@ class BrokerHandler(socketserver.StreamRequestHandler):
 
             result = self._process_request(request)
 
-            response = {"ok": True, "data": result}
+            response = {
+                "ok": True,
+                "data": result
+            }
 
         except (ValueError, TypeError, RuntimeError) as error:
-            response = {"ok": False, "error": str(error)}
+            response = {
+                "ok": False,
+                "error": str(error)
+            }
 
         except (OSError, UnicodeError):
             response = {
@@ -55,6 +64,7 @@ class BrokerHandler(socketserver.StreamRequestHandler):
             self.wfile.write(
                 (json.dumps(response) + "\n").encode("utf-8")
             )
+
         except OSError:
             pass
 
@@ -64,7 +74,10 @@ class BrokerHandler(socketserver.StreamRequestHandler):
         customer_service = self.server.customer_service
         admin_auth = self.server.admin_auth
 
+        # ----------------------------------------
         # Administrator operations
+        # ----------------------------------------
+
         if action == "admin_request_otp":
             return admin_auth.request_otp(
                 request.get("admin_password")
@@ -75,7 +88,6 @@ class BrokerHandler(socketserver.StreamRequestHandler):
                 request.get("otp")
             )
 
-        
         if action in (
             "admin_status",
             "admin_logout",
@@ -83,6 +95,7 @@ class BrokerHandler(socketserver.StreamRequestHandler):
             "admin_exchange_statistics"
         ):
             admin_token = request.get("admin_token")
+
             admin_auth.require_admin(admin_token)
 
             if action == "admin_logout":
@@ -99,7 +112,10 @@ class BrokerHandler(socketserver.StreamRequestHandler):
                 "administrator_authenticated": True
             }
 
+        # ----------------------------------------
         # Customer registration and login
+        # ----------------------------------------
+
         if action == "register":
             return customer_service.register(
                 request.get("username"),
@@ -112,10 +128,16 @@ class BrokerHandler(socketserver.StreamRequestHandler):
                 request.get("password")
             )
 
-            return {"session_token": token}
+            return {
+                "session_token": token
+            }
 
-        # Remaining customer operations require login
+        # ----------------------------------------
+        # Authenticated customer operations
+        # ----------------------------------------
+
         token = request.get("session_token")
+
         customer_service.get_username(token)
 
         if action == "logout":
@@ -132,6 +154,10 @@ class BrokerHandler(socketserver.StreamRequestHandler):
         elif action == "get_portfolio":
             return customer_service.get_portfolio(token)
 
+        # ----------------------------------------
+        # Persistent order submission
+        # ----------------------------------------
+
         elif action == "buy":
             return customer_service.buy_stock(
                 token,
@@ -144,6 +170,22 @@ class BrokerHandler(socketserver.StreamRequestHandler):
                 token,
                 request.get("symbol"),
                 request.get("quantity")
+            )
+
+        # ----------------------------------------
+        # Order status and cancellation
+        # ----------------------------------------
+
+        elif action == "get_order":
+            return customer_service.get_order(
+                token,
+                request.get("order_id")
+            )
+
+        elif action == "cancel_order":
+            return customer_service.cancel_order(
+                token,
+                request.get("order_id")
             )
 
         else:
@@ -172,18 +214,45 @@ class BrokerServer(socketserver.ThreadingTCPServer):
 
 
 def main():
+
+    # ----------------------------------------
+    # Connect to Exchange Server
+    # ----------------------------------------
+
     gateway = ExchangeGateway()
 
-    customer_repository = CustomerRepository(
-        BASE_DIR / "data" / "customers.json"
+    # ----------------------------------------
+    # Persistent customers and orders
+    # ----------------------------------------
+
+    trading_repository = TradingRepository(
+        BASE_DIR / "data" / "trading.json"
     )
 
-    customer_service = CustomerService(
-        customer_repository,
+    order_processor = OrderProcessor(
+        trading_repository,
         gateway
     )
 
-    admin_password = os.environ.get("STOCK_ADMIN_PASSWORD")
+    # ----------------------------------------
+    # Producer/Consumer queue
+    # ----------------------------------------
+
+    order_queue = OrderQueue(
+        order_processor
+    )
+
+    customer_service = QueuedCustomerService(
+        order_queue
+    )
+
+    # ----------------------------------------
+    # Administrator authentication
+    # ----------------------------------------
+
+    admin_password = os.environ.get(
+        "STOCK_ADMIN_PASSWORD"
+    )
 
     if not admin_password:
         raise RuntimeError(
@@ -199,21 +268,33 @@ def main():
         admin_password
     )
 
-    with BrokerServer(
-        ("127.0.0.1", 9002),
-        customer_service,
-        gateway,
-        admin_auth
-    ) as server:
+    # ----------------------------------------
+    # Start order worker and Broker Server
+    # ----------------------------------------
 
-        print("Broker Server running on port 9002")
-        print("Individual customer accounts enabled!")
-        print("Trading and persistent storage enabled!")
-        print("Administrator OTP authentication enabled!")
+    order_queue.start()
 
-        server.serve_forever()
+    try:
+        with BrokerServer(
+            ("127.0.0.1", 9002),
+            customer_service,
+            gateway,
+            admin_auth
+        ) as server:
+
+            print("Broker Server running on port 9002")
+            print("Customer accounts enabled!")
+            print("Persistent order queue enabled!")
+            print("Producer/Consumer pattern enabled!")
+            print("Stock trading enabled!")
+            print("Administrator OTP authentication enabled!")
+
+            server.serve_forever()
+
+    finally:
+        # Stop the worker when the server shuts down.
+        order_queue.stop()
 
 
 if __name__ == "__main__":
     main()
-

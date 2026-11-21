@@ -5,16 +5,15 @@ from getpass import getpass
 
 
 class CustomerClient:
-
     def __init__(self):
         self.host = "127.0.0.1"
         self.port = 9002
         self.session_token = None
         self.username = None
+        self.last_order_id = None
 
     def send_request(self, action, **parameters):
-        request = {"action": action}
-        request.update(parameters)
+        request = {"action": action, **parameters}
 
         if self.session_token is not None:
             request["session_token"] = self.session_token
@@ -38,12 +37,11 @@ class CustomerClient:
             ) from error
 
         if not response_line.endswith(b"\n"):
-            raise RuntimeError(
-                "Incomplete response. Try again."
-            )
+            raise RuntimeError("Incomplete response. Try again.")
 
         try:
             response = json.loads(response_line)
+
         except (ValueError, UnicodeError) as error:
             raise RuntimeError(
                 "Invalid response from Broker Server."
@@ -63,7 +61,9 @@ class CustomerClient:
         print("\n=== REGISTER CUSTOMER ===")
 
         username = input("Choose username: ").strip()
-        password = getpass("Choose password (min 8 characters): ")
+        password = getpass(
+            "Choose password (min 8 characters): "
+        )
 
         result = self.send_request(
             "register",
@@ -90,13 +90,17 @@ class CustomerClient:
 
         self.session_token = result["session_token"]
         self.username = username
+        self.last_order_id = None
 
         print(f"Welcome, {username}!")
 
     def logout(self):
         self.send_request("logout")
+
         self.session_token = None
         self.username = None
+        self.last_order_id = None
+
         print("Logged out successfully.")
 
     def show_prices(self):
@@ -117,42 +121,112 @@ class CustomerClient:
 
         print(f"{symbol.upper()}: ${price / 100:.2f}")
 
-    def buy_stock(self):
+    def _show_order(self, order):
+        status = order["status"]
+
+        print(f"\nOrder ID: {order['order_id']}")
+        print(f"Status: {status}")
+
+        if status == "PENDING":
+            print("Your order is waiting to be processed.")
+
+        elif status == "FILLED":
+            result = order["result"]
+
+            shares = result["shares"]
+            symbol = result["symbol"]
+
+            if order["side"] == "buy":
+                amount = result["cost_cents"]
+
+                print(
+                    f"Bought {shares} {symbol} shares "
+                    f"for ${amount / 100:.2f}"
+                )
+
+            else:
+                amount = result["proceeds_cents"]
+
+                print(
+                    f"Sold {shares} {symbol} shares "
+                    f"for ${amount / 100:.2f}"
+                )
+
+        elif status in ("REJECTED", "CANCELLED"):
+            print(
+                f"Reason: {order.get('error') or 'Not available'}"
+            )
+
+    def _place_order(self, side):
         symbol = input("Stock symbol: ").strip()
         quantity = int(input("Number of shares: "))
 
-        result = self.send_request(
-            "buy",
+        order = self.send_request(
+            side,
             symbol=symbol,
             quantity=quantity
         )
 
+        self.last_order_id = order["order_id"]
+
+        print("Order submitted successfully.")
+
+        self._show_order(order)
+
         print(
-            f"Bought {result['shares']} shares of "
-            f"{result['symbol']} for "
-            f"${result['cost_cents'] / 100:.2f}"
+            "Use 'Check order status' to see the final result."
         )
+
+    def buy_stock(self):
+        self._place_order("buy")
 
     def sell_stock(self):
-        symbol = input("Stock symbol: ").strip()
-        quantity = int(input("Number of shares: "))
+        self._place_order("sell")
 
-        result = self.send_request(
-            "sell",
-            symbol=symbol,
-            quantity=quantity
+    def _ask_order_id(self):
+        if self.last_order_id is None:
+            order_id = input("Order ID: ").strip()
+
+        else:
+            print(f"Last order ID: {self.last_order_id}")
+
+            order_id = input(
+                "Order ID (Enter = last order): "
+            ).strip()
+
+            if not order_id:
+                order_id = self.last_order_id
+
+        if not order_id:
+            raise ValueError("Enter a valid order ID.")
+
+        return order_id
+
+    def check_order_status(self):
+        order_id = self._ask_order_id()
+
+        order = self.send_request(
+            "get_order",
+            order_id=order_id
         )
 
-        print(
-            f"Sold {result['shares']} shares of "
-            f"{result['symbol']} for "
-            f"${result['proceeds_cents'] / 100:.2f}"
+        self._show_order(order)
+
+    def cancel_order(self):
+        order_id = self._ask_order_id()
+
+        order = self.send_request(
+            "cancel_order",
+            order_id=order_id
         )
+
+        self._show_order(order)
 
     def show_portfolio(self):
         portfolio = self.send_request("get_portfolio")
 
         print(f"\n=== {self.username}'s PORTFOLIO ===")
+
         print(
             f"Available cash: "
             f"${portfolio['cash_cents'] / 100:.2f}"
@@ -167,13 +241,15 @@ class CustomerClient:
         for symbol, position in holdings.items():
             print(
                 f"{symbol}: {position['shares']} shares, "
-                f"paid ${position['total_paid_cents'] / 100:.2f}"
+                f"paid "
+                f"${position['total_paid_cents'] / 100:.2f}"
             )
 
     def run(self):
         while True:
             try:
                 if self.session_token is None:
+
                     print("\n=== STOCK MARKET EXCHANGE ===")
                     print("1. Register")
                     print("2. Login")
@@ -195,14 +271,20 @@ class CustomerClient:
                         print("Choose 1, 2, or 3.")
 
                 else:
-                    print(f"\n=== CUSTOMER: {self.username} ===")
+
+                    print(
+                        f"\n=== CUSTOMER: {self.username} ==="
+                    )
+
                     print("1. View stock prices")
                     print("2. Search stock")
                     print("3. Buy stock")
                     print("4. Sell stock")
                     print("5. View portfolio")
-                    print("6. Logout")
-                    print("7. Exit")
+                    print("6. Check order status")
+                    print("7. Cancel pending order")
+                    print("8. Logout")
+                    print("9. Exit")
 
                     choice = input("Choose option: ").strip()
 
@@ -222,16 +304,27 @@ class CustomerClient:
                         self.show_portfolio()
 
                     elif choice == "6":
-                        self.logout()
+                        self.check_order_status()
 
                     elif choice == "7":
+                        self.cancel_order()
+
+                    elif choice == "8":
+                        self.logout()
+
+                    elif choice == "9":
                         print("Goodbye!")
                         break
 
                     else:
-                        print("Choose a number from 1 to 7.")
+                        print("Choose a number from 1 to 9.")
 
-            except (RuntimeError, ValueError, KeyError, TypeError) as error:
+            except (
+                RuntimeError,
+                ValueError,
+                KeyError,
+                TypeError
+            ) as error:
                 print(f"Error: {error}")
 
 
