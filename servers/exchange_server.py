@@ -1,6 +1,6 @@
 
 import json
-import hmac
+import logging
 import secrets
 import socketserver
 import threading
@@ -11,10 +11,20 @@ from services.exchange_service import ExchangeService
 from repositories.exchange_repository import ExchangeRepository
 from services.server_auth import sign_message, verify_message
 from services.replay_guard import ReplayGuard
+from services.logging_setup import configure_logging
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 KEY_FILE = BASE_DIR / "data" / "server_key.txt"
+
+logger = logging.getLogger("exchange")
+
+SAFE_ACTIONS = frozenset({
+    "get_prices",
+    "get_price",
+    "get_history",
+    "get_statistics"
+})
 
 
 def load_server_key():
@@ -34,10 +44,12 @@ def load_server_key():
 class ExchangeHandler(socketserver.StreamRequestHandler):
 
     def handle(self):
-        self.request.settimeout(5)
         request = {}
+        action_for_log = "unknown"
 
         try:
+            self.request.settimeout(5)
+
             raw = self.rfile.readline(8192)
 
             if not raw.endswith(b"\n"):
@@ -48,15 +60,21 @@ class ExchangeHandler(socketserver.StreamRequestHandler):
             request = json.loads(raw.decode("utf-8"))
 
             if not isinstance(request, dict):
-                raise ValueError("Request must be a JSON object.")
+                raise ValueError(
+                    "Request must be a JSON object."
+                )
 
+            # Verify the Broker Server's signature.
             if not verify_message(
                 request,
                 self.server.server_key,
                 "broker-request"
             ):
-                raise ValueError("Invalid server signature.")
+                raise ValueError(
+                    "Invalid server signature."
+                )
 
+            # Reject duplicate or expired requests.
             if not self.server.replay_guard.accept(
                 request.get("nonce"),
                 request.get("timestamp")
@@ -66,8 +84,16 @@ class ExchangeHandler(socketserver.StreamRequestHandler):
                 )
 
             action = request.get("action")
+
+            if (
+                isinstance(action, str)
+                and action in SAFE_ACTIONS
+            ):
+                action_for_log = action
+
             exchange = self.server.exchange
 
+            # Process the authenticated request.
             if action == "get_prices":
                 result = exchange.get_prices()
 
@@ -87,32 +113,68 @@ class ExchangeHandler(socketserver.StreamRequestHandler):
             else:
                 raise ValueError(
                     "Unknown action. Use get_prices, "
-                    "get_price or get_history."
+                    "get_price, get_history or get_statistics."
                 )
 
-            response = {"ok": True, "data": result}
+            logger.info(
+                "Exchange request completed: action=%s",
+                action_for_log
+            )
+
+            response = {
+                "ok": True,
+                "data": result
+            }
 
         except (ValueError, TypeError, UnicodeError) as error:
-            response = {"ok": False, "error": str(error)}
+            logger.warning(
+                "Exchange request rejected: "
+                "action=%s error_type=%s",
+                action_for_log,
+                type(error).__name__
+            )
 
-        except OSError:
+            response = {
+                "ok": False,
+                "error": str(error)
+            }
+
+        except OSError as error:
+            logger.warning(
+                "Exchange communication failure: "
+                "action=%s error_type=%s",
+                action_for_log,
+                type(error).__name__
+            )
+
             response = {
                 "ok": False,
                 "error": "Communication failed. Try again."
             }
 
-        except Exception:
+        except Exception as error:
+            # Avoid logging unexpected exception messages,
+            # which could contain sensitive information.
+            logger.error(
+                "Exchange internal failure: "
+                "action=%s error_type=%s",
+                action_for_log,
+                type(error).__name__
+            )
+
             response = {
                 "ok": False,
                 "error": "Internal server error."
             }
 
+        # Preserve the request nonce in the response.
         response["nonce"] = (
             request.get("nonce")
             if isinstance(request, dict)
             else None
         )
 
+        # Sign every response, including errors.
         response["signature"] = sign_message(
             response,
             self.server.server_key,
@@ -123,37 +185,87 @@ class ExchangeHandler(socketserver.StreamRequestHandler):
             self.wfile.write(
                 (json.dumps(response) + "\n").encode("utf-8")
             )
+
         except OSError:
-            pass
+            logger.warning(
+                "Failed to send Exchange response"
+            )
 
 
 class ExchangeServer(socketserver.ThreadingTCPServer):
+
     allow_reuse_address = True
     daemon_threads = True
 
     def __init__(self, address, exchange, server_key):
         self.exchange = exchange
         self.server_key = server_key
-        self.replay_guard = ReplayGuard(ttl_seconds=300)
-        super().__init__(address, ExchangeHandler)
+        self.replay_guard = ReplayGuard(
+            ttl_seconds=300
+        )
+
+        super().__init__(
+            address,
+            ExchangeHandler
+        )
 
 
 def automatic_price_updates(exchange, stop_event):
     while not stop_event.wait(30):
+
         try:
             prices = exchange.simulate_tick()
-            print("Automatic price update:", prices)
+
+            print(
+                "Automatic price update:",
+                prices
+            )
+
+            logger.info(
+                "Automatic stock price update completed"
+            )
 
         except (OSError, ValueError) as error:
-            print("Price update failed:", error)
+            logger.error(
+                "Automatic price update failed: "
+                "error_type=%s",
+                type(error).__name__
+            )
+
+            print(
+                "Price update failed:",
+                error
+            )
 
 
 def main():
+
+    # ----------------------------------------
+    # Configure Exchange Server logging
+    # ----------------------------------------
+
+    configure_logging(
+        "exchange",
+        BASE_DIR / "data" / "logs"
+    )
+
+    logger.info(
+        "Exchange Server starting"
+    )
+
+    # ----------------------------------------
+    # Create initial stocks
+    # ----------------------------------------
+
     stocks = [
         Stock("Apple", "AAPL", 20000),
         Stock("Tesla", "TSLA", 25000),
         Stock("Microsoft", "MSFT", 40000)
     ]
+
+    # ----------------------------------------
+    # Persistent exchange repository
+    # ----------------------------------------
 
     repository = ExchangeRepository(
         BASE_DIR / "data" / "exchange.json"
@@ -164,8 +276,17 @@ def main():
         repository=repository
     )
 
+    # ----------------------------------------
+    # Secure server communication
+    # ----------------------------------------
+
     server_key = load_server_key()
+
     stop_event = threading.Event()
+
+    # ----------------------------------------
+    # Start the Exchange Server
+    # ----------------------------------------
 
     with ExchangeServer(
         ("127.0.0.1", 9001),
@@ -181,16 +302,39 @@ def main():
 
         update_thread.start()
 
-        print("Exchange Server running on port 9001")
-        print("Automatic price updates enabled!")
-        print("Price updates every 30 seconds")
-        print("Persistent exchange history enabled!")
+        logger.info(
+            "Exchange Server started on port 9001"
+        )
+
+        print(
+            "Exchange Server running on port 9001"
+        )
+        print(
+            "Automatic price updates enabled!"
+        )
+        print(
+            "Price updates every 30 seconds"
+        )
+        print(
+            "Persistent exchange history enabled!"
+        )
+        print(
+            "Exchange logging enabled!"
+        )
 
         try:
             server.serve_forever()
+
         except KeyboardInterrupt:
-            print("Stopping Exchange Server...")
+            print(
+                "Stopping Exchange Server..."
+            )
+
         finally:
+            logger.info(
+                "Exchange Server shutting down"
+            )
+
             stop_event.set()
             update_thread.join(timeout=2)
 

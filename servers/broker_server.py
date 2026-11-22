@@ -1,5 +1,6 @@
 
 import json
+import logging
 import os
 import socketserver
 from pathlib import Path
@@ -7,6 +8,7 @@ from pathlib import Path
 from services.exchange_gateway import ExchangeGateway
 from services.admin_otp_service import AdminOTPService
 from services.admin_auth_service import AdminAuthService
+from services.logging_setup import configure_logging
 
 from repositories.trading_repository import TradingRepository
 from services.order_processor import OrderProcessor
@@ -16,13 +18,36 @@ from services.queued_customer_service import QueuedCustomerService
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+logger = logging.getLogger("broker")
+
+SAFE_ACTIONS = frozenset({
+    "register",
+    "login",
+    "logout",
+    "get_prices",
+    "get_price",
+    "get_portfolio",
+    "buy",
+    "sell",
+    "get_order",
+    "cancel_order",
+    "admin_request_otp",
+    "admin_login",
+    "admin_status",
+    "admin_logout",
+    "admin_statistics",
+    "admin_exchange_statistics"
+})
+
 
 class BrokerHandler(socketserver.StreamRequestHandler):
 
     def handle(self):
-        self.request.settimeout(5)
+        action_for_log = "unknown"
 
         try:
+            self.request.settimeout(5)
+
             raw = self.rfile.readline(8192)
 
             if not raw.endswith(b"\n"):
@@ -35,7 +60,17 @@ class BrokerHandler(socketserver.StreamRequestHandler):
             if not isinstance(request, dict):
                 raise ValueError("Request must be a JSON object.")
 
+            action = request.get("action")
+
+            if isinstance(action, str) and action in SAFE_ACTIONS:
+                action_for_log = action
+
             result = self._process_request(request)
+
+            logger.info(
+                "Request completed: action=%s",
+                action_for_log
+            )
 
             response = {
                 "ok": True,
@@ -43,21 +78,46 @@ class BrokerHandler(socketserver.StreamRequestHandler):
             }
 
         except (ValueError, TypeError, RuntimeError) as error:
+            logger.warning(
+                "Request rejected: action=%s error_type=%s",
+                action_for_log,
+                type(error).__name__
+            )
+
             response = {
                 "ok": False,
+                "error_code": "REQUEST_REJECTED",
                 "error": str(error)
             }
 
-        except (OSError, UnicodeError):
+        except (OSError, UnicodeError) as error:
+            logger.warning(
+                "Communication failure: action=%s error_type=%s",
+                action_for_log,
+                type(error).__name__
+            )
+
             response = {
                 "ok": False,
+                "error_code": "COMMUNICATION_ERROR",
                 "error": "Communication failed. Try again."
             }
 
-        except Exception:
+        except Exception as error:
+            # Do not write exception messages here because
+            # unexpected errors might contain sensitive input.
+            logger.error(
+                "Internal failure: action=%s error_type=%s",
+                action_for_log,
+                type(error).__name__
+            )
+
             response = {
                 "ok": False,
-                "error": "Internal server error. Contact administrator."
+                "error_code": "INTERNAL_ERROR",
+                "error": (
+                    "Internal server error. Contact administrator."
+                )
             }
 
         try:
@@ -66,7 +126,9 @@ class BrokerHandler(socketserver.StreamRequestHandler):
             )
 
         except OSError:
-            pass
+            logger.warning(
+                "Failed to send Broker response"
+            )
 
     def _process_request(self, request):
         action = request.get("action")
@@ -74,9 +136,7 @@ class BrokerHandler(socketserver.StreamRequestHandler):
         customer_service = self.server.customer_service
         admin_auth = self.server.admin_auth
 
-        # ----------------------------------------
         # Administrator operations
-        # ----------------------------------------
 
         if action == "admin_request_otp":
             return admin_auth.request_otp(
@@ -112,9 +172,7 @@ class BrokerHandler(socketserver.StreamRequestHandler):
                 "administrator_authenticated": True
             }
 
-        # ----------------------------------------
         # Customer registration and login
-        # ----------------------------------------
 
         if action == "register":
             return customer_service.register(
@@ -132,9 +190,7 @@ class BrokerHandler(socketserver.StreamRequestHandler):
                 "session_token": token
             }
 
-        # ----------------------------------------
         # Authenticated customer operations
-        # ----------------------------------------
 
         token = request.get("session_token")
 
@@ -154,9 +210,7 @@ class BrokerHandler(socketserver.StreamRequestHandler):
         elif action == "get_portfolio":
             return customer_service.get_portfolio(token)
 
-        # ----------------------------------------
-        # Persistent order submission
-        # ----------------------------------------
+        # Persistent stock orders
 
         elif action == "buy":
             return customer_service.buy_stock(
@@ -171,10 +225,6 @@ class BrokerHandler(socketserver.StreamRequestHandler):
                 request.get("symbol"),
                 request.get("quantity")
             )
-
-        # ----------------------------------------
-        # Order status and cancellation
-        # ----------------------------------------
 
         elif action == "get_order":
             return customer_service.get_order(
@@ -215,15 +265,18 @@ class BrokerServer(socketserver.ThreadingTCPServer):
 
 def main():
 
-    # ----------------------------------------
-    # Connect to Exchange Server
-    # ----------------------------------------
+    configure_logging(
+        "broker",
+        BASE_DIR / "data" / "logs"
+    )
+
+    logger.info("Broker Server starting")
+
+    # Exchange connection
 
     gateway = ExchangeGateway()
 
-    # ----------------------------------------
-    # Persistent customers and orders
-    # ----------------------------------------
+    # Persistent customer and order database
 
     trading_repository = TradingRepository(
         BASE_DIR / "data" / "trading.json"
@@ -234,21 +287,15 @@ def main():
         gateway
     )
 
-    # ----------------------------------------
     # Producer/Consumer queue
-    # ----------------------------------------
 
-    order_queue = OrderQueue(
-        order_processor
-    )
+    order_queue = OrderQueue(order_processor)
 
     customer_service = QueuedCustomerService(
         order_queue
     )
 
-    # ----------------------------------------
     # Administrator authentication
-    # ----------------------------------------
 
     admin_password = os.environ.get(
         "STOCK_ADMIN_PASSWORD"
@@ -268,9 +315,7 @@ def main():
         admin_password
     )
 
-    # ----------------------------------------
-    # Start order worker and Broker Server
-    # ----------------------------------------
+    # Start Broker Server
 
     order_queue.start()
 
@@ -282,17 +327,22 @@ def main():
             admin_auth
         ) as server:
 
+            logger.info(
+                "Broker Server started on port 9002"
+            )
+
             print("Broker Server running on port 9002")
             print("Customer accounts enabled!")
             print("Persistent order queue enabled!")
             print("Producer/Consumer pattern enabled!")
             print("Stock trading enabled!")
             print("Administrator OTP authentication enabled!")
+            print("Broker logging enabled!")
 
             server.serve_forever()
 
     finally:
-        # Stop the worker when the server shuts down.
+        logger.info("Broker Server shutting down")
         order_queue.stop()
 
 
