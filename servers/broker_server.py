@@ -1,10 +1,10 @@
 
-import json
 import logging
 import os
 import socketserver
 from pathlib import Path
 
+from services.base_request_handler import BaseRequestHandler
 from services.exchange_gateway import ExchangeGateway
 from services.admin_otp_service import AdminOTPService
 from services.admin_auth_service import AdminAuthService
@@ -40,97 +40,53 @@ SAFE_ACTIONS = frozenset({
 })
 
 
-class BrokerHandler(socketserver.StreamRequestHandler):
+class BrokerHandler(BaseRequestHandler):
 
-    def handle(self):
-        action_for_log = "unknown"
+    logger = logger
+    safe_actions = SAFE_ACTIONS
 
-        try:
-            self.request.settimeout(5)
+    def _handle_error(self, error, action_for_log):
 
-            raw = self.rfile.readline(8192)
-
-            if not raw.endswith(b"\n"):
-                raise ValueError(
-                    "Incomplete request. Send one complete JSON line."
-                )
-
-            request = json.loads(raw.decode("utf-8"))
-
-            if not isinstance(request, dict):
-                raise ValueError("Request must be a JSON object.")
-
-            action = request.get("action")
-
-            if isinstance(action, str) and action in SAFE_ACTIONS:
-                action_for_log = action
-
-            result = self._process_request(request)
-
-            logger.info(
-                "Request completed: action=%s",
-                action_for_log
-            )
-
-            response = {
-                "ok": True,
-                "data": result
-            }
-
-        except (ValueError, TypeError, RuntimeError) as error:
+        if isinstance(error, (ValueError, TypeError, RuntimeError)):
             logger.warning(
                 "Request rejected: action=%s error_type=%s",
                 action_for_log,
                 type(error).__name__
             )
 
-            response = {
+            return {
                 "ok": False,
                 "error_code": "REQUEST_REJECTED",
                 "error": str(error)
             }
 
-        except (OSError, UnicodeError) as error:
+        if isinstance(error, (OSError, UnicodeError)):
             logger.warning(
                 "Communication failure: action=%s error_type=%s",
                 action_for_log,
                 type(error).__name__
             )
 
-            response = {
+            return {
                 "ok": False,
                 "error_code": "COMMUNICATION_ERROR",
                 "error": "Communication failed. Try again."
             }
 
-        except Exception as error:
-            # Do not write exception messages here because
-            # unexpected errors might contain sensitive input.
-            logger.error(
-                "Internal failure: action=%s error_type=%s",
-                action_for_log,
-                type(error).__name__
-            )
+        logger.error(
+            "Internal failure: action=%s error_type=%s",
+            action_for_log,
+            type(error).__name__
+        )
 
-            response = {
-                "ok": False,
-                "error_code": "INTERNAL_ERROR",
-                "error": (
-                    "Internal server error. Contact administrator."
-                )
-            }
-
-        try:
-            self.wfile.write(
-                (json.dumps(response) + "\n").encode("utf-8")
-            )
-
-        except OSError:
-            logger.warning(
-                "Failed to send Broker response"
-            )
+        return {
+            "ok": False,
+            "error_code": "INTERNAL_ERROR",
+            "error": "Internal server error. Contact administrator."
+        }
 
     def _process_request(self, request):
+
         action = request.get("action")
 
         customer_service = self.server.customer_service
@@ -338,6 +294,7 @@ def main():
             print("Stock trading enabled!")
             print("Administrator OTP authentication enabled!")
             print("Broker logging enabled!")
+            print("Template Method pattern enabled!")
 
             server.serve_forever()
 

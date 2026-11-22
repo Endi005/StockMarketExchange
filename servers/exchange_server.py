@@ -1,5 +1,4 @@
 
-import json
 import logging
 import secrets
 import socketserver
@@ -7,6 +6,7 @@ import threading
 from pathlib import Path
 
 from models.stock import Stock
+from services.base_request_handler import BaseRequestHandler
 from services.exchange_service import ExchangeService
 from repositories.exchange_repository import ExchangeRepository
 from services.server_auth import sign_message, verify_message
@@ -41,92 +41,60 @@ def load_server_key():
     ).strip()
 
 
-class ExchangeHandler(socketserver.StreamRequestHandler):
+class ExchangeHandler(BaseRequestHandler):
 
-    def handle(self):
-        request = {}
-        action_for_log = "unknown"
+    logger = logger
+    safe_actions = SAFE_ACTIONS
 
-        try:
-            self.request.settimeout(5)
-
-            raw = self.rfile.readline(8192)
-
-            if not raw.endswith(b"\n"):
-                raise ValueError(
-                    "Incomplete request. Send one JSON line."
-                )
-
-            request = json.loads(raw.decode("utf-8"))
-
-            if not isinstance(request, dict):
-                raise ValueError(
-                    "Request must be a JSON object."
-                )
-
-            # Verify the Broker Server's signature.
-            if not verify_message(
-                request,
-                self.server.server_key,
-                "broker-request"
-            ):
-                raise ValueError(
-                    "Invalid server signature."
-                )
-
-            # Reject duplicate or expired requests.
-            if not self.server.replay_guard.accept(
-                request.get("nonce"),
-                request.get("timestamp")
-            ):
-                raise ValueError(
-                    "Duplicate or expired server request."
-                )
-
-            action = request.get("action")
-
-            if (
-                isinstance(action, str)
-                and action in SAFE_ACTIONS
-            ):
-                action_for_log = action
-
-            exchange = self.server.exchange
-
-            # Process the authenticated request.
-            if action == "get_prices":
-                result = exchange.get_prices()
-
-            elif action == "get_price":
-                result = exchange.get_price(
-                    request.get("symbol")
-                )
-
-            elif action == "get_history":
-                result = exchange.get_history(
-                    request.get("symbol")
-                )
-
-            elif action == "get_statistics":
-                result = exchange.get_statistics()
-
-            else:
-                raise ValueError(
-                    "Unknown action. Use get_prices, "
-                    "get_price, get_history or get_statistics."
-                )
-
-            logger.info(
-                "Exchange request completed: action=%s",
-                action_for_log
+    def _validate_request(self, request):
+        # Verify the Broker Server's signature.
+        if not verify_message(
+            request,
+            self.server.server_key,
+            "broker-request"
+        ):
+            raise ValueError(
+                "Invalid server signature."
             )
 
-            response = {
-                "ok": True,
-                "data": result
-            }
+        # Reject duplicate or expired requests.
+        if not self.server.replay_guard.accept(
+            request.get("nonce"),
+            request.get("timestamp")
+        ):
+            raise ValueError(
+                "Duplicate or expired server request."
+            )
 
-        except (ValueError, TypeError, UnicodeError) as error:
+    def _process_request(self, request):
+        action = request.get("action")
+        exchange = self.server.exchange
+
+        if action == "get_prices":
+            return exchange.get_prices()
+
+        elif action == "get_price":
+            return exchange.get_price(
+                request.get("symbol")
+            )
+
+        elif action == "get_history":
+            return exchange.get_history(
+                request.get("symbol")
+            )
+
+        elif action == "get_statistics":
+            return exchange.get_statistics()
+
+        else:
+            raise ValueError(
+                "Unknown action. Use get_prices, "
+                "get_price, get_history or get_statistics."
+            )
+
+    def _handle_error(self, error, action_for_log):
+
+        if isinstance(error, (ValueError, TypeError, UnicodeError)):
             logger.warning(
                 "Exchange request rejected: "
                 "action=%s error_type=%s",
@@ -134,12 +102,12 @@ class ExchangeHandler(socketserver.StreamRequestHandler):
                 type(error).__name__
             )
 
-            response = {
+            return {
                 "ok": False,
                 "error": str(error)
             }
 
-        except OSError as error:
+        if isinstance(error, OSError):
             logger.warning(
                 "Exchange communication failure: "
                 "action=%s error_type=%s",
@@ -147,27 +115,25 @@ class ExchangeHandler(socketserver.StreamRequestHandler):
                 type(error).__name__
             )
 
-            response = {
+            return {
                 "ok": False,
                 "error": "Communication failed. Try again."
             }
 
-        except Exception as error:
-            # Avoid logging unexpected exception messages,
-            # which could contain sensitive information.
-            logger.error(
-                "Exchange internal failure: "
-                "action=%s error_type=%s",
-                action_for_log,
-                type(error).__name__
-            )
+        logger.error(
+            "Exchange internal failure: "
+            "action=%s error_type=%s",
+            action_for_log,
+            type(error).__name__
+        )
 
-            response = {
-                "ok": False,
-                "error": "Internal server error."
-            }
+        return {
+            "ok": False,
+            "error": "Internal server error."
+        }
 
-        # Preserve the request nonce in the response.
+    def _prepare_response(self, request, response):
+        # Preserve the request nonce in every response.
         response["nonce"] = (
             request.get("nonce")
             if isinstance(request, dict)
@@ -181,15 +147,7 @@ class ExchangeHandler(socketserver.StreamRequestHandler):
             "exchange-response"
         )
 
-        try:
-            self.wfile.write(
-                (json.dumps(response) + "\n").encode("utf-8")
-            )
-
-        except OSError:
-            logger.warning(
-                "Failed to send Exchange response"
-            )
+        return response
 
 
 class ExchangeServer(socketserver.ThreadingTCPServer):
@@ -240,9 +198,7 @@ def automatic_price_updates(exchange, stop_event):
 
 def main():
 
-    # ----------------------------------------
     # Configure Exchange Server logging
-    # ----------------------------------------
 
     configure_logging(
         "exchange",
@@ -253,9 +209,7 @@ def main():
         "Exchange Server starting"
     )
 
-    # ----------------------------------------
     # Create initial stocks
-    # ----------------------------------------
 
     stocks = [
         Stock("Apple", "AAPL", 20000),
@@ -263,9 +217,7 @@ def main():
         Stock("Microsoft", "MSFT", 40000)
     ]
 
-    # ----------------------------------------
     # Persistent exchange repository
-    # ----------------------------------------
 
     repository = ExchangeRepository(
         BASE_DIR / "data" / "exchange.json"
@@ -276,17 +228,13 @@ def main():
         repository=repository
     )
 
-    # ----------------------------------------
     # Secure server communication
-    # ----------------------------------------
 
     server_key = load_server_key()
 
     stop_event = threading.Event()
 
-    # ----------------------------------------
     # Start the Exchange Server
-    # ----------------------------------------
 
     with ExchangeServer(
         ("127.0.0.1", 9001),
@@ -320,6 +268,9 @@ def main():
         )
         print(
             "Exchange logging enabled!"
+        )
+        print(
+            "Template Method pattern enabled!"
         )
 
         try:
