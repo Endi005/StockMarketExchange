@@ -1,4 +1,3 @@
-
 import logging
 import secrets
 import socketserver
@@ -12,6 +11,7 @@ from repositories.exchange_repository import ExchangeRepository
 from services.server_auth import sign_message, verify_message
 from services.replay_guard import ReplayGuard
 from services.logging_setup import configure_logging
+from services.performance_monitor import PerformanceMonitor
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -47,7 +47,7 @@ class ExchangeHandler(BaseRequestHandler):
     safe_actions = SAFE_ACTIONS
 
     def _validate_request(self, request):
-        # Verify the Broker Server's signature.
+
         if not verify_message(
             request,
             self.server.server_key,
@@ -57,7 +57,6 @@ class ExchangeHandler(BaseRequestHandler):
                 "Invalid server signature."
             )
 
-        # Reject duplicate or expired requests.
         if not self.server.replay_guard.accept(
             request.get("nonce"),
             request.get("timestamp")
@@ -67,6 +66,7 @@ class ExchangeHandler(BaseRequestHandler):
             )
 
     def _process_request(self, request):
+
         action = request.get("action")
         exchange = self.server.exchange
 
@@ -84,7 +84,14 @@ class ExchangeHandler(BaseRequestHandler):
             )
 
         elif action == "get_statistics":
-            return exchange.get_statistics()
+
+            statistics = exchange.get_statistics()
+
+            statistics["performance"] = (
+                self.server.performance_monitor.get_statistics()
+            )
+
+            return statistics
 
         else:
             raise ValueError(
@@ -104,6 +111,7 @@ class ExchangeHandler(BaseRequestHandler):
 
             return {
                 "ok": False,
+                "error_code": "REQUEST_REJECTED",
                 "error": str(error)
             }
 
@@ -117,6 +125,7 @@ class ExchangeHandler(BaseRequestHandler):
 
             return {
                 "ok": False,
+                "error_code": "COMMUNICATION_ERROR",
                 "error": "Communication failed. Try again."
             }
 
@@ -129,18 +138,18 @@ class ExchangeHandler(BaseRequestHandler):
 
         return {
             "ok": False,
+            "error_code": "INTERNAL_ERROR",
             "error": "Internal server error."
         }
 
     def _prepare_response(self, request, response):
-        # Preserve the request nonce in every response.
+
         response["nonce"] = (
             request.get("nonce")
             if isinstance(request, dict)
             else None
         )
 
-        # Sign every response, including errors.
         response["signature"] = sign_message(
             response,
             self.server.server_key,
@@ -156,11 +165,15 @@ class ExchangeServer(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
     def __init__(self, address, exchange, server_key):
+
         self.exchange = exchange
         self.server_key = server_key
+
         self.replay_guard = ReplayGuard(
             ttl_seconds=300
         )
+
+        self.performance_monitor = PerformanceMonitor()
 
         super().__init__(
             address,
@@ -169,6 +182,7 @@ class ExchangeServer(socketserver.ThreadingTCPServer):
 
 
 def automatic_price_updates(exchange, stop_event):
+
     while not stop_event.wait(30):
 
         try:
@@ -184,6 +198,7 @@ def automatic_price_updates(exchange, stop_event):
             )
 
         except (OSError, ValueError) as error:
+
             logger.error(
                 "Automatic price update failed: "
                 "error_type=%s",
@@ -198,8 +213,6 @@ def automatic_price_updates(exchange, stop_event):
 
 def main():
 
-    # Configure Exchange Server logging
-
     configure_logging(
         "exchange",
         BASE_DIR / "data" / "logs"
@@ -209,15 +222,11 @@ def main():
         "Exchange Server starting"
     )
 
-    # Create initial stocks
-
     stocks = [
         Stock("Apple", "AAPL", 20000),
         Stock("Tesla", "TSLA", 25000),
         Stock("Microsoft", "MSFT", 40000)
     ]
-
-    # Persistent exchange repository
 
     repository = ExchangeRepository(
         BASE_DIR / "data" / "exchange.json"
@@ -228,13 +237,9 @@ def main():
         repository=repository
     )
 
-    # Secure server communication
-
     server_key = load_server_key()
 
     stop_event = threading.Event()
-
-    # Start the Exchange Server
 
     with ExchangeServer(
         ("127.0.0.1", 9001),
@@ -271,6 +276,9 @@ def main():
         )
         print(
             "Template Method pattern enabled!"
+        )
+        print(
+            "Performance monitoring enabled!"
         )
 
         try:

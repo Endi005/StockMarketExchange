@@ -1,4 +1,3 @@
-
 import logging
 import os
 import socketserver
@@ -9,6 +8,7 @@ from services.exchange_gateway import ExchangeGateway
 from services.admin_otp_service import AdminOTPService
 from services.admin_auth_service import AdminAuthService
 from services.logging_setup import configure_logging
+from services.performance_monitor import PerformanceMonitor
 
 from repositories.trading_repository import TradingRepository
 from services.order_processor import OrderProcessor
@@ -118,7 +118,16 @@ class BrokerHandler(BaseRequestHandler):
                 return admin_auth.logout(admin_token)
 
             if action == "admin_statistics":
-                return customer_service.get_statistics()
+
+                statistics = dict(
+                    customer_service.get_statistics()
+                )
+
+                statistics["performance"] = (
+                    self.server.performance_monitor.get_statistics()
+                )
+
+                return statistics
 
             if action == "admin_exchange_statistics":
                 return self.server.gateway.get_statistics()
@@ -216,6 +225,8 @@ class BrokerServer(socketserver.ThreadingTCPServer):
         self.gateway = gateway
         self.admin_auth = admin_auth
 
+        self.performance_monitor = PerformanceMonitor()
+
         super().__init__(address, BrokerHandler)
 
 
@@ -295,6 +306,7 @@ def main():
             print("Administrator OTP authentication enabled!")
             print("Broker logging enabled!")
             print("Template Method pattern enabled!")
+            print("Performance monitoring enabled!")
 
             server.serve_forever()
 

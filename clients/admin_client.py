@@ -1,4 +1,3 @@
-
 import json
 import socket
 from getpass import getpass
@@ -53,8 +52,19 @@ class AdminClient:
             raise RuntimeError("Invalid response format.")
 
         if response.get("ok") is not True:
+
+            error_code = response.get(
+                "error_code",
+                "REQUEST_FAILED"
+            )
+
+            message = response.get(
+                "error",
+                "Request failed."
+            )
+
             raise RuntimeError(
-                response.get("error", "Request failed.")
+                f"[{error_code}] {message}"
             )
 
         return response["data"]
@@ -98,16 +108,88 @@ class AdminClient:
             f"{result['administrator_authenticated']}"
         )
 
+    def show_performance(self, performance, server_name):
+
+        print(f"\n=== {server_name.upper()} PERFORMANCE ===")
+
+        print(
+            f"Uptime: "
+            f"{performance['uptime_seconds']:.2f} seconds"
+        )
+
+        print(
+            f"Total requests: "
+            f"{performance['total_requests']}"
+        )
+
+        print(
+            f"Successful requests: "
+            f"{performance['successful_requests']}"
+        )
+
+        print(
+            f"Failed requests: "
+            f"{performance['failed_requests']}"
+        )
+
+        print(
+            f"Failure rate: "
+            f"{performance['failure_rate_percent']:.2f}%"
+        )
+
+        print(
+            f"Average request duration: "
+            f"{performance['average_duration_ms']:.3f} ms"
+        )
+
+        print(
+            f"Maximum request duration: "
+            f"{performance['max_duration_ms']:.3f} ms"
+        )
+
+        print(
+            f"Average throughput: "
+            f"{performance['requests_per_second']:.3f} requests/sec"
+        )
+
+        print("\nPerformance by operation:")
+
+        actions = performance["actions"]
+
+        if not actions:
+            print("  No completed requests recorded yet.")
+
+        for action, stats in sorted(actions.items()):
+
+            print(f"\n  Operation: {action}")
+            print(f"    Requests: {stats['requests']}")
+            print(f"    Successful: {stats['successful']}")
+            print(f"    Failed: {stats['failed']}")
+
+            print(
+                f"    Average duration: "
+                f"{stats['average_duration_ms']:.3f} ms"
+            )
+
     def show_statistics(self):
         result = self.send_request("admin_statistics")
 
         print("\n=== CUSTOMER STATISTICS ===")
         print(f"Registered customers: {result['customer_count']}")
+
         print(
             f"Total customer cash: "
             f"${result['total_cash_cents'] / 100:.2f}"
         )
+
         print(f"Total shares owned: {result['total_shares']}")
+
+        if "performance" in result:
+
+            self.show_performance(
+                result["performance"],
+                "Broker Server"
+            )
 
     def show_exchange_statistics(self):
         result = self.send_request(
@@ -118,12 +200,21 @@ class AdminClient:
         print(f"Available stocks: {result['stock_count']}")
 
         print("\nCurrent stock prices:")
+
         for symbol, price_cents in result["prices"].items():
             print(f"  {symbol}: ${price_cents / 100:.2f}")
 
         print("\nRecorded price history:")
+
         for symbol, count in result["history_entries"].items():
             print(f"  {symbol}: {count} entries")
+
+        if "performance" in result:
+
+            self.show_performance(
+                result["performance"],
+                "Exchange Server"
+            )
 
     def logout(self):
         self.send_request("admin_logout")
@@ -157,7 +248,7 @@ class AdminClient:
                 else:
                     print("\n=== ADMIN MENU ===")
                     print("1. View Broker Server status")
-                    print("2. View customer statistics")
+                    print("2. View customer and Broker statistics")
                     print("3. View Exchange Server statistics")
                     print("4. Logout")
                     print("5. Exit")

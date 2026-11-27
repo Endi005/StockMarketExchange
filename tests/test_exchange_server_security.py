@@ -1,4 +1,3 @@
-
 import io
 import json
 import unittest
@@ -9,6 +8,7 @@ from models.stock import Stock
 from services.exchange_service import ExchangeService
 from services.replay_guard import ReplayGuard
 from services.server_auth import sign_message, verify_message
+from services.performance_monitor import PerformanceMonitor
 from servers.exchange_server import ExchangeHandler
 
 
@@ -27,7 +27,8 @@ class TestExchangeServerSecurity(unittest.TestCase):
             replay_guard=ReplayGuard(
                 ttl_seconds=300,
                 clock=lambda: 1000
-            )
+            ),
+            performance_monitor=PerformanceMonitor()
         )
 
     def make_request(self, action="get_prices"):
@@ -121,6 +122,70 @@ class TestExchangeServerSecurity(unittest.TestCase):
             response["data"]["stock_count"],
             1
         )
+
+        self.assertIn("performance", response["data"])
+
+        self.assertTrue(
+            verify_message(
+                response,
+                self.secret,
+                "exchange-response"
+            )
+        )
+
+    def test_successful_request_is_monitored(self):
+        response = self.send_request(self.make_request())
+
+        self.assertTrue(response["ok"])
+
+        stats = self.server.performance_monitor.get_statistics()
+
+        self.assertEqual(stats["total_requests"], 1)
+        self.assertEqual(stats["successful_requests"], 1)
+        self.assertEqual(stats["failed_requests"], 0)
+
+    def test_invalid_signature_is_monitored(self):
+        request = self.make_request()
+        request["signature"] = "invalid-signature"
+
+        response = self.send_request(request)
+
+        self.assertFalse(response["ok"])
+        self.assertEqual(
+            response["error_code"],
+            "REQUEST_REJECTED"
+        )
+
+        stats = self.server.performance_monitor.get_statistics()
+
+        self.assertEqual(stats["total_requests"], 1)
+        self.assertEqual(stats["successful_requests"], 0)
+        self.assertEqual(stats["failed_requests"], 1)
+
+    def test_replay_failure_is_monitored(self):
+        request = self.make_request()
+
+        first_response = self.send_request(request)
+        second_response = self.send_request(request)
+
+        self.assertTrue(first_response["ok"])
+        self.assertFalse(second_response["ok"])
+
+        stats = self.server.performance_monitor.get_statistics()
+
+        self.assertEqual(stats["total_requests"], 2)
+        self.assertEqual(stats["successful_requests"], 1)
+        self.assertEqual(stats["failed_requests"], 1)
+        self.assertEqual(stats["failure_rate_percent"], 50.0)
+
+    def test_statistics_requires_valid_signature(self):
+        request = self.make_request("get_statistics")
+        request["signature"] = "invalid-signature"
+
+        response = self.send_request(request)
+
+        self.assertFalse(response["ok"])
+        self.assertNotIn("data", response)
 
 
 if __name__ == "__main__":
