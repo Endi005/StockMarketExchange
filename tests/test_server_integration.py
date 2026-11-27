@@ -37,31 +37,29 @@ class ServerIntegrationTests(unittest.TestCase):
             exchange_service,
             key
         )
-
-        self.addCleanup(
-            self.exchange_server.server_close
-        )
+        self.addCleanup(self.exchange_server.server_close)
 
         exchange_thread = threading.Thread(
             target=self.exchange_server.serve_forever,
             daemon=True
         )
         exchange_thread.start()
+        self.addCleanup(self.exchange_server.shutdown)
 
-        self.addCleanup(
-            self.exchange_server.shutdown
-        )
-
-        gateway = ExchangeGateway(
+        self.gateway = ExchangeGateway(
             port=self.exchange_server.server_address[1]
         )
-        gateway.key_file = key_path
+        self.gateway.key_file = key_path
 
-        repository = TradingRepository(
+        self.repository = TradingRepository(
             Path(self.temp_dir.name) / "trading.json"
         )
 
-        processor = OrderProcessor(repository, gateway)
+        processor = OrderProcessor(
+            self.repository,
+            self.gateway
+        )
+
         self.order_queue = OrderQueue(processor)
         self.order_queue.start()
         self.addCleanup(self.order_queue.stop)
@@ -73,23 +71,17 @@ class ServerIntegrationTests(unittest.TestCase):
         self.broker_server = BrokerServer(
             ("127.0.0.1", 0),
             customer_service,
-            gateway,
+            self.gateway,
             object()
         )
-
-        self.addCleanup(
-            self.broker_server.server_close
-        )
+        self.addCleanup(self.broker_server.server_close)
 
         broker_thread = threading.Thread(
             target=self.broker_server.serve_forever,
             daemon=True
         )
         broker_thread.start()
-
-        self.addCleanup(
-            self.broker_server.shutdown
-        )
+        self.addCleanup(self.broker_server.shutdown)
 
     def send_broker_request(self, request):
         with socket.create_connection(
@@ -103,46 +95,12 @@ class ServerIntegrationTests(unittest.TestCase):
                     (json.dumps(request) + "\n").encode("utf-8")
                 )
                 stream.flush()
-
                 response = stream.readline(8192)
 
         self.assertTrue(response.endswith(b"\n"))
         return json.loads(response.decode("utf-8"))
 
-    def test_broker_gets_prices_from_real_exchange(self):
-        registration = self.send_broker_request({
-            "action": "register",
-            "username": "IntegrationUser",
-            "password": "SecurePass123!"
-        })
-        self.assertTrue(registration["ok"], registration)
-
-        login = self.send_broker_request({
-            "action": "login",
-            "username": "IntegrationUser",
-            "password": "SecurePass123!"
-        })
-        self.assertTrue(login["ok"], login)
-
-        token = login["data"]["session_token"]
-
-        prices = self.send_broker_request({
-            "action": "get_prices",
-            "session_token": token
-        })
-
-        self.assertTrue(prices["ok"], prices)
-        self.assertEqual(
-            prices["data"]["AAPL"],
-            20000
-        )
-        self.assertEqual(
-            prices["data"]["TSLA"],
-            25000
-        )
-
-    def test_customer_can_submit_buy_order(self):
-        username = "TradingTestUser"
+    def register_and_login(self, username):
         password = "SecurePass123!"
 
         registration = self.send_broker_request({
@@ -159,7 +117,22 @@ class ServerIntegrationTests(unittest.TestCase):
         })
         self.assertTrue(login["ok"], login)
 
-        token = login["data"]["session_token"]
+        return login["data"]["session_token"]
+
+    def test_broker_gets_prices_from_real_exchange(self):
+        token = self.register_and_login("IntegrationUser")
+
+        prices = self.send_broker_request({
+            "action": "get_prices",
+            "session_token": token
+        })
+
+        self.assertTrue(prices["ok"], prices)
+        self.assertEqual(prices["data"]["AAPL"], 20000)
+        self.assertEqual(prices["data"]["TSLA"], 25000)
+
+    def test_customer_can_submit_buy_order(self):
+        token = self.register_and_login("TradingTestUser")
 
         buy_response = self.send_broker_request({
             "action": "buy",
@@ -185,6 +158,74 @@ class ServerIntegrationTests(unittest.TestCase):
         self.assertEqual(
             order_response["data"]["symbol"],
             "AAPL"
+        )
+
+    def test_completed_trade_survives_processor_restart(self):
+        token = self.register_and_login("PersistenceUser")
+
+        buy_response = self.send_broker_request({
+            "action": "buy",
+            "session_token": token,
+            "symbol": "AAPL",
+            "quantity": 1
+        })
+        self.assertTrue(buy_response["ok"], buy_response)
+
+        order_id = buy_response["data"]["order_id"]
+
+        # Wait for asynchronous order processing to finish.
+        self.order_queue.wait_until_idle()
+
+        completed_response = self.send_broker_request({
+            "action": "get_order",
+            "session_token": token,
+            "order_id": order_id
+        })
+        self.assertTrue(
+            completed_response["ok"],
+            completed_response
+        )
+
+        completed_order = completed_response["data"]
+
+        self.assertEqual(
+            completed_order["status"],
+            "FILLED"
+        )
+
+        # Create a fresh repository using the same persistent file.
+        restarted_repository = TradingRepository(
+            Path(self.temp_dir.name) / "trading.json"
+        )
+
+        # Create a fresh processor that reloads saved data.
+        restarted_processor = OrderProcessor(
+            restarted_repository,
+            self.gateway
+        )
+
+        restored_order = restarted_processor.get_order(
+            order_id
+        )
+
+        self.assertEqual(
+            restored_order["status"],
+            "FILLED"
+        )
+        self.assertEqual(
+            restored_order["order_id"],
+            order_id
+        )
+
+        restored_portfolio = (
+            restarted_processor.get_customer_portfolio(
+                "PersistenceUser"
+            )
+        )
+
+        self.assertEqual(
+            restored_portfolio["holdings"]["AAPL"]["shares"],
+            1
         )
 
 
