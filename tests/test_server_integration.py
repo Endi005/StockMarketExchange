@@ -1,4 +1,7 @@
 import io
+import re
+import secrets
+import time
 import json
 import socket
 import tempfile
@@ -12,6 +15,7 @@ from models.stock import Stock
 from repositories.trading_repository import TradingRepository
 from services.exchange_service import ExchangeService
 from services.exchange_gateway import ExchangeGateway
+from services.server_auth import sign_message, verify_message
 from services.order_processor import OrderProcessor
 from services.order_queue import OrderQueue
 from services.queued_customer_service import QueuedCustomerService
@@ -310,7 +314,7 @@ class ServerIntegrationTests(unittest.TestCase):
             1
         )
 
-    # New performance and security integration tests.
+    # Performance and security integration tests.
 
     def test_real_administrator_authentication(self):
 
@@ -397,8 +401,7 @@ class ServerIntegrationTests(unittest.TestCase):
             .get_statistics()
         )
 
-        # Stop accepting exchange connections and wait for
-        # active exchange handlers to finish recording metrics.
+        # Wait for active exchange handlers to finish.
         self.exchange_server.shutdown()
         self.exchange_server.server_close()
 
@@ -539,6 +542,337 @@ class ServerIntegrationTests(unittest.TestCase):
         self.assertIn("Maximum request duration:", displayed)
         self.assertIn("Average throughput:", displayed)
         self.assertIn("Performance by operation:", displayed)
+
+    # Correlation integration helpers.
+
+    def correlation_ids(self, logs, action):
+
+        pattern = (
+            r"correlation_id=([0-9a-f]{32}) action="
+            + re.escape(action)
+            + r" success=True\b"
+        )
+
+        return re.findall(
+            pattern,
+            "\n".join(logs)
+        )
+
+    def finish_exchange_requests(self):
+
+        self.exchange_server.shutdown()
+        self.exchange_server.server_close()
+
+    # Cross-server correlation integration tests.
+
+    def test_synchronous_cross_server_correlation(self):
+
+        token = self.register_and_login(
+            "CorrelationUser"
+        )
+
+        with self.assertLogs(
+            "broker", level="INFO"
+        ) as broker_logs:
+
+            with self.assertLogs(
+                "exchange", level="INFO"
+            ) as exchange_logs:
+
+                response = self.send_broker_request({
+                    "action": "get_prices",
+                    "session_token": token
+                })
+
+                self.assertTrue(response["ok"], response)
+
+                self.finish_exchange_requests()
+
+        broker_ids = self.correlation_ids(
+            broker_logs.output,
+            "get_prices"
+        )
+
+        exchange_ids = self.correlation_ids(
+            exchange_logs.output,
+            "get_prices"
+        )
+
+        self.assertEqual(len(broker_ids), 1)
+        self.assertEqual(broker_ids, exchange_ids)
+
+    def verify_trade_correlation(self, side):
+
+        token = self.register_and_login(
+            "TradeCorrelationUser"
+        )
+
+        # A sell order requires an existing holding.
+        if side == "sell":
+
+            purchase = self.send_broker_request({
+                "action": "buy",
+                "session_token": token,
+                "symbol": "AAPL",
+                "quantity": 1
+            })
+
+            self.assertTrue(purchase["ok"], purchase)
+
+            self.order_queue.wait_until_idle()
+
+            self.assertEqual(
+                self.order_queue.get_order(
+                    purchase["data"]["order_id"]
+                )["status"],
+                "FILLED"
+            )
+
+        with self.assertLogs(
+            "broker", level="INFO"
+        ) as broker_logs:
+
+            with self.assertLogs(
+                "exchange", level="INFO"
+            ) as exchange_logs:
+
+                response = self.send_broker_request({
+                    "action": side,
+                    "session_token": token,
+                    "symbol": "AAPL",
+                    "quantity": 1
+                })
+
+                self.assertTrue(response["ok"], response)
+
+                self.order_queue.wait_until_idle()
+
+                order = self.order_queue.get_order(
+                    response["data"]["order_id"]
+                )
+
+                self.finish_exchange_requests()
+
+        self.assertEqual(
+            order["status"],
+            "FILLED"
+        )
+
+        broker_ids = self.correlation_ids(
+            broker_logs.output,
+            side
+        )
+
+        exchange_ids = self.correlation_ids(
+            exchange_logs.output,
+            "get_price"
+        )
+
+        self.assertEqual(
+            broker_ids,
+            [order["correlation_id"]]
+        )
+
+        self.assertEqual(
+            exchange_ids,
+            broker_ids
+        )
+
+        completed = [
+            line
+            for line in broker_logs.output
+            if "Order execution completed:" in line
+        ]
+
+        self.assertEqual(len(completed), 1)
+
+        self.assertIn(
+            "correlation_id=" + order["correlation_id"],
+            completed[0]
+        )
+
+        self.assertIn(
+            "order_id=" + order["order_id"],
+            completed[0]
+        )
+
+        self.assertIn(
+            "status=FILLED",
+            completed[0]
+        )
+
+    def test_asynchronous_buy_correlation(self):
+
+        self.verify_trade_correlation("buy")
+
+    def test_asynchronous_sell_correlation(self):
+
+        self.verify_trade_correlation("sell")
+
+    def test_separate_requests_have_distinct_correlation_ids(self):
+
+        token = self.register_and_login(
+            "IsolationUser"
+        )
+
+        with self.assertLogs(
+            "broker", level="INFO"
+        ) as broker_logs:
+
+            with self.assertLogs(
+                "exchange", level="INFO"
+            ) as exchange_logs:
+
+                for _ in range(2):
+
+                    response = self.send_broker_request({
+                        "action": "get_prices",
+                        "session_token": token
+                    })
+
+                    self.assertTrue(
+                        response["ok"],
+                        response
+                    )
+
+                self.finish_exchange_requests()
+
+        broker_ids = self.correlation_ids(
+            broker_logs.output,
+            "get_prices"
+        )
+
+        exchange_ids = self.correlation_ids(
+            exchange_logs.output,
+            "get_prices"
+        )
+
+        self.assertEqual(len(broker_ids), 2)
+        self.assertEqual(len(set(broker_ids)), 2)
+
+        self.assertCountEqual(
+            broker_ids,
+            exchange_ids
+        )
+
+    def test_customer_cannot_choose_correlation_id(self):
+
+        token = self.register_and_login(
+            "UntrustedCorrelationUser"
+        )
+
+        supplied = "f" * 32
+
+        with self.assertLogs(
+            "broker", level="INFO"
+        ) as broker_logs:
+
+            with self.assertLogs(
+                "exchange", level="INFO"
+            ) as exchange_logs:
+
+                response = self.send_broker_request({
+                    "action": "get_prices",
+                    "session_token": token,
+                    "correlation_id": supplied
+                })
+
+                self.assertTrue(response["ok"], response)
+
+                self.finish_exchange_requests()
+
+        broker_ids = self.correlation_ids(
+            broker_logs.output,
+            "get_prices"
+        )
+
+        self.assertEqual(len(broker_ids), 1)
+
+        self.assertNotIn(
+            supplied,
+            broker_ids
+        )
+
+        self.assertEqual(
+            broker_ids,
+            self.correlation_ids(
+                exchange_logs.output,
+                "get_prices"
+            )
+        )
+
+    def test_exchange_rejects_invalid_and_tampered_correlation(self):
+
+        key = self.gateway.key_file.read_text(
+            encoding="utf-8"
+        ).strip()
+
+        for tampered in (False, True):
+
+            with self.subTest(tampered=tampered):
+
+                request = {
+                    "action": "get_prices",
+                    "nonce": secrets.token_urlsafe(24),
+                    "timestamp": time.time(),
+                    "correlation_id": (
+                        "a" * 32
+                        if tampered
+                        else "invalid"
+                    )
+                }
+
+                request["signature"] = sign_message(
+                    request,
+                    key,
+                    "broker-request"
+                )
+
+                if tampered:
+                    request["correlation_id"] = "b" * 32
+
+                with socket.create_connection(
+                    self.exchange_server.server_address,
+                    timeout=5
+                ) as connection:
+
+                    with connection.makefile("rwb") as stream:
+
+                        stream.write(
+                            (json.dumps(request) + "\n")
+                            .encode("utf-8")
+                        )
+
+                        stream.flush()
+
+                        response = json.loads(
+                            stream.readline(8192)
+                        )
+
+                self.assertTrue(
+                    verify_message(
+                        response,
+                        key,
+                        "exchange-response"
+                    )
+                )
+
+                self.assertFalse(response["ok"])
+
+                self.assertEqual(
+                    response["error_code"],
+                    "REQUEST_REJECTED"
+                )
+
+                self.assertNotIn(
+                    "data",
+                    response
+                )
+
+                self.assertNotEqual(
+                    response["correlation_id"],
+                    request["correlation_id"]
+                )
 
 
 if __name__ == "__main__":

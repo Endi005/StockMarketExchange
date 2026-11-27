@@ -1,6 +1,7 @@
 import logging
 import os
 import socketserver
+import traceback
 from pathlib import Path
 
 from services.base_request_handler import BaseRequestHandler
@@ -9,6 +10,8 @@ from services.admin_otp_service import AdminOTPService
 from services.admin_auth_service import AdminAuthService
 from services.logging_setup import configure_logging
 from services.performance_monitor import PerformanceMonitor
+from services.correlation_context import get_correlation_id
+from services.application_errors import ApplicationError
 
 from repositories.trading_repository import TradingRepository
 from services.order_processor import OrderProcessor
@@ -47,9 +50,54 @@ class BrokerHandler(BaseRequestHandler):
 
     def _handle_error(self, error, action_for_log):
 
-        if isinstance(error, (ValueError, TypeError, RuntimeError)):
+        correlation_id = get_correlation_id()
+
+        # Controlled application failures.
+
+        if isinstance(error, ApplicationError):
+
             logger.warning(
-                "Request rejected: action=%s error_type=%s",
+                "Application failure: "
+                "correlation_id=%s action=%s "
+                "error_type=%s error_code=%s",
+                correlation_id,
+                action_for_log,
+                type(error).__name__,
+                error.error_code
+            )
+
+            return {
+                "ok": False,
+                "error_code": error.error_code,
+                "error": error.public_message
+            }
+
+        # Invalid request encoding.
+
+        if isinstance(error, UnicodeError):
+
+            logger.warning(
+                "Invalid request encoding: "
+                "correlation_id=%s action=%s error_type=%s",
+                correlation_id,
+                action_for_log,
+                type(error).__name__
+            )
+
+            return {
+                "ok": False,
+                "error_code": "REQUEST_REJECTED",
+                "error": "Invalid request encoding. Send UTF-8 JSON."
+            }
+
+        # Expected validation and business-rule failures.
+
+        if isinstance(error, ValueError):
+
+            logger.warning(
+                "Request rejected: "
+                "correlation_id=%s action=%s error_type=%s",
+                correlation_id,
                 action_for_log,
                 type(error).__name__
             )
@@ -60,9 +108,14 @@ class BrokerHandler(BaseRequestHandler):
                 "error": str(error)
             }
 
-        if isinstance(error, (OSError, UnicodeError)):
+        # Socket communication failures.
+
+        if isinstance(error, (ConnectionError, TimeoutError)):
+
             logger.warning(
-                "Communication failure: action=%s error_type=%s",
+                "Communication failure: "
+                "correlation_id=%s action=%s error_type=%s",
+                correlation_id,
                 action_for_log,
                 type(error).__name__
             )
@@ -73,10 +126,34 @@ class BrokerHandler(BaseRequestHandler):
                 "error": "Communication failed. Try again."
             }
 
+        # Unexpected internal failures.
+        # Record the failure location without logging
+        # exception messages, credentials or local variables.
+
+        frames = traceback.extract_tb(error.__traceback__)
+
+        if frames:
+
+            last_frame = frames[-1]
+
+            location = (
+                f"{Path(last_frame.filename).name}:"
+                f"{last_frame.lineno}:"
+                f"{last_frame.name}"
+            )
+
+        else:
+
+            location = "unknown"
+
         logger.error(
-            "Internal failure: action=%s error_type=%s",
+            "Internal failure: "
+            "correlation_id=%s action=%s "
+            "error_type=%s location=%s",
+            correlation_id,
             action_for_log,
-            type(error).__name__
+            type(error).__name__,
+            location
         )
 
         return {
@@ -110,6 +187,7 @@ class BrokerHandler(BaseRequestHandler):
             "admin_statistics",
             "admin_exchange_statistics"
         ):
+
             admin_token = request.get("admin_token")
 
             admin_auth.require_admin(admin_token)
@@ -307,6 +385,8 @@ def main():
             print("Broker logging enabled!")
             print("Template Method pattern enabled!")
             print("Performance monitoring enabled!")
+            print("Cross-server correlation enabled!")
+            print("Structured error handling enabled!")
 
             server.serve_forever()
 

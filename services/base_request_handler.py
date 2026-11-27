@@ -1,18 +1,31 @@
 import json
 import socketserver
 import time
-import uuid
+
+from services.correlation_context import (
+    generate_correlation_id,
+    correlation_scope,
+    get_correlation_id
+)
 
 
 class BaseRequestHandler(socketserver.StreamRequestHandler):
 
     def handle(self):
 
+        request_id = generate_correlation_id()
+
+        with correlation_scope(request_id):
+
+            self._handle_request(request_id)
+
+    def _handle_request(self, request_id):
+
         started_at = time.perf_counter()
 
         request = {}
         action_for_log = "unknown"
-        request_id = uuid.uuid4().hex
+        correlation_id = request_id
 
         success = False
         error_code = "NONE"
@@ -32,7 +45,13 @@ class BaseRequestHandler(socketserver.StreamRequestHandler):
 
                 self._validate_request(request)
 
-                result = self._process_request(request)
+                correlation_id = self._resolve_correlation_id(
+                    request
+                )
+
+                with correlation_scope(correlation_id):
+
+                    result = self._process_request(request)
 
                 response = {
                     "ok": True,
@@ -41,10 +60,12 @@ class BaseRequestHandler(socketserver.StreamRequestHandler):
 
             except Exception as error:
 
-                response = self._handle_error(
-                    error,
-                    action_for_log
-                )
+                with correlation_scope(correlation_id):
+
+                    response = self._handle_error(
+                        error,
+                        action_for_log
+                    )
 
             error_code = response.get(
                 "error_code",
@@ -52,10 +73,12 @@ class BaseRequestHandler(socketserver.StreamRequestHandler):
                 else "REQUEST_FAILED"
             )
 
-            response = self._prepare_response(
-                request,
-                response
-            )
+            with correlation_scope(correlation_id):
+
+                response = self._prepare_response(
+                    request,
+                    response
+                )
 
             self.wfile.write(
                 (json.dumps(response) + "\n").encode("utf-8")
@@ -69,8 +92,9 @@ class BaseRequestHandler(socketserver.StreamRequestHandler):
 
             self.logger.warning(
                 "Response communication failed: "
-                "request_id=%s action=%s",
+                "request_id=%s correlation_id=%s action=%s",
                 request_id,
+                correlation_id,
                 action_for_log
             )
 
@@ -80,8 +104,10 @@ class BaseRequestHandler(socketserver.StreamRequestHandler):
 
             self.logger.error(
                 "Response preparation failed: "
-                "request_id=%s action=%s error_type=%s",
+                "request_id=%s correlation_id=%s "
+                "action=%s error_type=%s",
                 request_id,
+                correlation_id,
                 action_for_log,
                 type(error).__name__
             )
@@ -106,19 +132,19 @@ class BaseRequestHandler(socketserver.StreamRequestHandler):
                     duration_ms
                 )
 
-            log_level = "INFO" if success else "WARNING"
-
             message = (
                 "Request completed: "
-                "request_id=%s action=%s success=%s "
+                "request_id=%s correlation_id=%s "
+                "action=%s success=%s "
                 "error_code=%s duration_ms=%.3f"
             )
 
-            if log_level == "INFO":
+            if success:
 
                 self.logger.info(
                     message,
                     request_id,
+                    correlation_id,
                     action_for_log,
                     success,
                     error_code,
@@ -130,6 +156,7 @@ class BaseRequestHandler(socketserver.StreamRequestHandler):
                 self.logger.warning(
                     message,
                     request_id,
+                    correlation_id,
                     action_for_log,
                     success,
                     error_code,
@@ -159,6 +186,11 @@ class BaseRequestHandler(socketserver.StreamRequestHandler):
     def _validate_request(self, request):
         """Child classes can provide their own security checks."""
         pass
+
+    def _resolve_correlation_id(self, request):
+        """Use the locally generated correlation ID by default."""
+
+        return get_correlation_id()
 
     def _process_request(self, request):
         """Each server must implement its own operations."""

@@ -1,4 +1,3 @@
-
 import hashlib
 import hmac
 import secrets
@@ -7,6 +6,7 @@ import time
 
 
 class AdminAuthService:
+    """Handles administrator authentication and sessions."""
 
     def __init__(
         self,
@@ -43,30 +43,35 @@ class AdminAuthService:
                 "OTP refused: invalid administrator password."
             )
 
+        # Expensive password hashing happens outside
+        # the administrator session lock.
         attempted_hash = self._hash_password(password)
 
-        with self._lock:
-            if not hmac.compare_digest(
-                attempted_hash, self._password_hash
-            ):
-                raise ValueError(
-                    "OTP refused: incorrect administrator password. "
-                    "Check your credentials."
-                )
+        if not hmac.compare_digest(
+            attempted_hash, self._password_hash
+        ):
+            raise ValueError(
+                "OTP refused: incorrect administrator password. "
+                "Check your credentials."
+            )
 
-            return self._otp_service.request_code()
+        # The OTP service protects its own shared state.
+        return self._otp_service.request_code()
 
     def login(self, code):
+        # OTP verification and mailbox operations happen
+        # outside the administrator session lock.
+        self._otp_service.verify_code(code)
+
+        token = secrets.token_urlsafe(32)
+
+        # Only protect the shared session dictionary.
         with self._lock:
-            self._otp_service.verify_code(code)
-
-            token = secrets.token_urlsafe(32)
-
             self._sessions[token] = (
                 self._clock() + self._session_ttl
             )
 
-            return {"session_token": token}
+        return {"session_token": token}
 
     def require_admin(self, token):
         with self._lock:

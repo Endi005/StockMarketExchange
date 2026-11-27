@@ -1,4 +1,3 @@
-
 import secrets
 
 from models.order_state import (
@@ -11,8 +10,15 @@ class Order:
     """A stock order with a persistent lifecycle."""
 
     def __init__(
-        self, username, symbol, side, quantity, order_id=None
+        self,
+        username,
+        symbol,
+        side,
+        quantity,
+        order_id=None,
+        correlation_id=None
     ):
+
         if not isinstance(username, str) or not username.strip():
             raise ValueError("Order requires a valid customer.")
 
@@ -31,11 +37,31 @@ class Order:
         if (
             not isinstance(order_id, str)
             or len(order_id) != 32
-            or any(char not in "0123456789abcdef" for char in order_id)
+            or any(
+                char not in "0123456789abcdef"
+                for char in order_id
+            )
         ):
             raise ValueError("Invalid order ID.")
 
+        # Provide a stable fallback for standalone
+        # orders and previously saved orders.
+        if correlation_id is None:
+            correlation_id = order_id
+
+        if (
+            not isinstance(correlation_id, str)
+            or len(correlation_id) != 32
+            or any(
+                char not in "0123456789abcdef"
+                for char in correlation_id
+            )
+        ):
+            raise ValueError("Invalid correlation ID.")
+
         self.order_id = order_id
+        self.correlation_id = correlation_id
+
         self.username = username.strip()
         self.symbol = symbol.strip().upper()
         self.side = side
@@ -59,6 +85,7 @@ class Order:
         return self._state.ensure_executable()
 
     def _expected_result(self, price_cents):
+
         amount = self.quantity * price_cents
 
         if self.side == "buy":
@@ -75,6 +102,7 @@ class Order:
         }
 
     def fill(self, price_cents, result):
+
         if type(price_cents) is not int or price_cents <= 0:
             raise ValueError("Invalid execution price.")
 
@@ -89,6 +117,7 @@ class Order:
         self._history.append(new_state.name)
 
     def reject(self, reason):
+
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("Rejection requires a reason.")
 
@@ -99,6 +128,7 @@ class Order:
         self._history.append(new_state.name)
 
     def cancel(self, reason="Cancelled by customer."):
+
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("Cancellation requires a reason.")
 
@@ -109,8 +139,10 @@ class Order:
         self._history.append(new_state.name)
 
     def to_record(self):
+
         return {
             "order_id": self.order_id,
+            "correlation_id": self.correlation_id,
             "username": self.username,
             "symbol": self.symbol,
             "side": self.side,
@@ -128,21 +160,40 @@ class Order:
 
     @classmethod
     def from_record(cls, record):
+
         required = {
             "order_id", "username", "symbol", "side",
             "quantity", "status", "history",
             "price_cents", "result", "error"
         }
 
-        if not isinstance(record, dict) or set(record) != required:
+        if not isinstance(record, dict):
             raise ValueError("Invalid saved order.")
+
+        # Accept both the previous and current
+        # persistent order formats.
+        current_fields = required | {"correlation_id"}
+
+        if set(record) not in (required, current_fields):
+            raise ValueError("Invalid saved order.")
+
+        correlation_id = record.get(
+            "correlation_id",
+            record["order_id"]
+        )
+
+        # A missing legacy field is supported,
+        # but an explicitly invalid value is rejected.
+        if correlation_id is None:
+            raise ValueError("Invalid saved correlation ID.")
 
         order = cls(
             record["username"],
             record["symbol"],
             record["side"],
             record["quantity"],
-            record["order_id"]
+            record["order_id"],
+            correlation_id
         )
 
         if record["username"] != order.username:
@@ -154,6 +205,7 @@ class Order:
         state = state_from_name(record["status"])
 
         expected_history = ["PENDING"]
+
         if state.name != "PENDING":
             expected_history.append(state.name)
 
@@ -165,10 +217,16 @@ class Order:
         error = record["error"]
 
         if state.name == "PENDING":
-            if price is not None or result is not None or error is not None:
+
+            if (
+                price is not None
+                or result is not None
+                or error is not None
+            ):
                 raise ValueError("Invalid pending order.")
 
         elif state.name == "FILLED":
+
             if (
                 type(price) is not int
                 or price <= 0
@@ -178,6 +236,7 @@ class Order:
                 raise ValueError("Invalid filled order.")
 
         else:
+
             if (
                 price is not None
                 or result is not None
@@ -190,7 +249,13 @@ class Order:
         order._state = state
         order._history = list(expected_history)
         order._price_cents = price
-        order._result = result.copy() if result is not None else None
+
+        order._result = (
+            result.copy()
+            if result is not None
+            else None
+        )
+
         order._error = error
 
         return order
