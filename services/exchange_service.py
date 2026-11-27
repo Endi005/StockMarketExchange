@@ -1,19 +1,25 @@
-
+import logging
 import threading
 
 from models.stock import Stock
 from services.price_history_observer import PriceHistoryObserver
 
+
+logger = logging.getLogger("exchange.market")
+
+
 class ExchangeService:
+    """Manages market prices, history and price-change observers."""
 
     def __init__(self, stocks, repository=None):
         self._repository = repository
+
         self._lock = threading.RLock()
+        self._update_lock = threading.Lock()
+
         self._stocks = {}
         self._history = {}
         self._observers = []
-        self._history_observer = PriceHistoryObserver(self._history)
-        self._observers.append(self._history_observer)
 
         saved_data = (
             repository.load()
@@ -28,7 +34,10 @@ class ExchangeService:
                     symbol,
                     record["price_cents"]
                 )
-                self._history[symbol] = list(record["history"])
+
+                self._history[symbol] = list(
+                    record["history"]
+                )
 
         else:
             for stock in stocks:
@@ -36,6 +45,7 @@ class ExchangeService:
                     raise ValueError("Duplicate stock symbol.")
 
                 self._stocks[stock.symbol] = stock
+
                 self._history[stock.symbol] = [
                     stock.get_price()
                 ]
@@ -45,25 +55,41 @@ class ExchangeService:
 
             if repository is not None:
                 repository.save(self._snapshot())
-    
-    
-    def _notify_observers(self, symbol, new_price, history):
-        for observer in self._observers:
-            if observer is self._history_observer:
-                original_history = observer._history
 
+    def add_observer(self, observer):
+        if not callable(
+            getattr(observer, "on_price_changed", None)
+        ):
+            raise ValueError("Invalid price observer.")
+
+        with self._lock:
+            if observer not in self._observers:
+                self._observers.append(observer)
+
+    def remove_observer(self, observer):
+        with self._lock:
+            if observer in self._observers:
+                self._observers.remove(observer)
+
+    def _notify_observers(self, events):
+        with self._lock:
+            observers = list(self._observers)
+
+        for symbol, new_price in events:
+            for observer in observers:
                 try:
-                    observer._history = history
                     observer.on_price_changed(
                         symbol, new_price
                     )
-                finally:
-                    observer._history = original_history
-            else:
-                observer.on_price_changed(
-                    symbol, new_price
-                )
 
+                except Exception:
+                    logger.exception(
+                        "Price observer failed: "
+                        "observer=%s symbol=%s price=%s",
+                        type(observer).__name__,
+                        symbol,
+                        new_price
+                    )
 
     def get_prices(self):
         with self._lock:
@@ -79,48 +105,85 @@ class ExchangeService:
     def get_history(self, symbol):
         with self._lock:
             stock = self._find_stock(symbol)
+
             return list(self._history[stock.symbol])
 
+    def _prepare_price_change(
+        self, snapshot, symbol, new_price
+    ):
+        record = snapshot["stocks"][symbol]
+
+        updated_stock = Stock(
+            record["name"],
+            symbol,
+            new_price
+        )
+
+        temporary_history = {
+            key: item["history"]
+            for key, item in snapshot["stocks"].items()
+        }
+
+        history_observer = PriceHistoryObserver(
+            temporary_history
+        )
+
+        history_observer.on_price_changed(
+            symbol,
+            updated_stock.get_price()
+        )
+
+        record["price_cents"] = updated_stock.get_price()
+
+    def _commit_snapshot(self, snapshot):
+        updated_stocks = {}
+        updated_history = {}
+
+        for symbol, record in snapshot["stocks"].items():
+            updated_stocks[symbol] = Stock(
+                record["name"],
+                symbol,
+                record["price_cents"]
+            )
+
+            updated_history[symbol] = record["history"]
+
+        if self._repository is not None:
+            self._repository.save(snapshot)
+
+        with self._lock:
+            self._stocks = updated_stocks
+            self._history = updated_history
 
     def update_price(self, symbol, new_price):
-        with self._lock:
-            stock = self._find_stock(symbol)
+        with self._update_lock:
+            with self._lock:
+                stock = self._find_stock(symbol)
+                symbol = stock.symbol
+                snapshot = self._snapshot()
 
-            updated_stock = Stock(
-                stock.name,
-                stock.symbol,
+            self._prepare_price_change(
+                snapshot,
+                symbol,
                 new_price
             )
 
-            snapshot = self._snapshot()
+            self._commit_snapshot(snapshot)
 
-           
-            temporary_history = {
-                key: record["history"]
-                for key, record in snapshot["stocks"].items()
-            }
+            committed_price = snapshot["stocks"][
+                symbol
+            ]["price_cents"]
 
-            
-            self._notify_observers(
-                stock.symbol,
-                updated_stock.get_price(),
-                temporary_history
-            )
-
-
-            record = snapshot["stocks"][stock.symbol]
-            record["price_cents"] = updated_stock.get_price()
-
-            # Save first. If saving fails, live state stays unchanged.
-            if self._repository is not None:
-                self._repository.save(snapshot)
-
-            self._stocks[stock.symbol] = updated_stock
-            self._history[stock.symbol] = record["history"]
+        self._notify_observers([
+            (symbol, committed_price)
+        ])
 
     def simulate_tick(self):
-        with self._lock:
-            snapshot = self._snapshot()
+        events = []
+
+        with self._update_lock:
+            with self._lock:
+                snapshot = self._snapshot()
 
             for symbol, record in snapshot["stocks"].items():
                 current = record["price_cents"]
@@ -131,32 +194,24 @@ class ExchangeService:
                 else:
                     new_price = max(1, current - change)
 
-
-                record["price_cents"] = new_price
-
-                temporary_history = {
-                    key: item["history"]
-                    for key, item in snapshot["stocks"].items()
-                }
-
-                self._notify_observers(
+                self._prepare_price_change(
+                    snapshot,
                     symbol,
-                    new_price,
-                    temporary_history
+                    new_price
                 )
 
-            if self._repository is not None:
-                self._repository.save(snapshot)
+                events.append((symbol, new_price))
 
-            for symbol, record in snapshot["stocks"].items():
-                self._stocks[symbol] = Stock(
-                    record["name"],
-                    symbol,
-                    record["price_cents"]
-                )
-                self._history[symbol] = record["history"]
+            self._commit_snapshot(snapshot)
 
-            return self.get_prices()
+            prices = {
+                symbol: record["price_cents"]
+                for symbol, record in snapshot["stocks"].items()
+            }
+
+        self._notify_observers(events)
+
+        return prices
 
     def get_statistics(self):
         with self._lock:
@@ -193,25 +248,3 @@ class ExchangeService:
             )
 
         return self._stocks[symbol]
-    
-    def test_observer_receives_automatic_price_updates(self):
-        class RecordingObserver:
-            def __init__(self):
-                self.events = []
-
-            def on_price_changed(self, symbol, new_price):
-                self.events.append((symbol, new_price))
-
-        observer = RecordingObserver()
-        self.exchange._observers.append(observer)
-
-        self.exchange.simulate_tick()
-
-        self.assertEqual(len(observer.events), 2)
-
-        for symbol, price in observer.events:
-            self.assertEqual(
-                price,
-                self.exchange.get_price(symbol)
-            )
-
